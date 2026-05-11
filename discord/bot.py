@@ -17,6 +17,7 @@ Whitelist + usage caps still key on author.id (per-user quota protection).
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import re
 from collections import defaultdict
@@ -31,6 +32,7 @@ from session_store import SessionStore
 from usage_tracker import UsageTracker
 
 DISCORD_MSG_LIMIT = 1900  # 2000 hard cap; leave headroom for meta + edits
+ATTACHMENT_THRESHOLD = 5700  # over this -> attach as .md instead of chunking
 THREAD_NAME_LIMIT = 95    # discord caps at 100
 THREAD_AUTO_ARCHIVE_MIN = 1440  # 24h
 MENTION_RE = re.compile(r"<@!?\d+>")
@@ -247,6 +249,22 @@ class RemoteBot(commands.Bot):
         self._chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._running: dict[int, asyncio.subprocess.Process] = {}
         self._cancelled: set[int] = set()
+        # Pending+running count per session_key, drives the 📥 vs ⏳ reaction
+        self._pending: dict[int, int] = defaultdict(int)
+
+    async def _safe_react(self, message: discord.Message, emoji: str) -> None:
+        try:
+            await message.add_reaction(emoji)
+        except discord.HTTPException:
+            pass
+
+    async def _safe_unreact(self, message: discord.Message, emoji: str) -> None:
+        if self.user is None:
+            return
+        try:
+            await message.remove_reaction(emoji, self.user)
+        except discord.HTTPException:
+            pass
 
     async def setup_hook(self) -> None:
         await self.add_cog(RemoteCog(self))
@@ -329,40 +347,64 @@ class RemoteBot(commands.Bot):
                 )
             return
 
-        async with self._chat_locks[session_key]:
-            state = self.store.get(session_key, self.cfg.default_project)
-            cwd = self.cfg.projects[state.project]
+        # Reactions on the user's message act as queue-state indicator.
+        self._pending[session_key] += 1
+        queued = self._pending[session_key] > 1
+        await self._safe_react(message, "📥" if queued else "⏳")
 
-            placeholder = await target.send(f"執行中… ({state.project})")
+        try:
+            async with self._chat_locks[session_key]:
+                if queued:
+                    await self._safe_unreact(message, "📥")
+                    await self._safe_react(message, "⏳")
 
-            def _on_started(p: asyncio.subprocess.Process) -> None:
-                self._running[session_key] = p
+                state = self.store.get(session_key, self.cfg.default_project)
+                cwd = self.cfg.projects[state.project]
 
-            try:
-                async with target.typing():
-                    result = await self.runner.run(
-                        prompt=prompt,
-                        cwd=cwd,
-                        resume_session_id=state.session_id,
-                        on_started=_on_started,
-                    )
-            finally:
-                self._running.pop(session_key, None)
+                placeholder = await target.send(f"執行中… ({state.project})")
 
-            if session_key in self._cancelled:
-                self._cancelled.discard(session_key)
+                def _on_started(p: asyncio.subprocess.Process) -> None:
+                    self._running[session_key] = p
+
                 try:
-                    await placeholder.edit(content="⏹ 已取消")
-                except discord.HTTPException as e:
-                    log.warning("cancel placeholder edit failed: %s", e)
-                return
+                    async with target.typing():
+                        result = await self.runner.run(
+                            prompt=prompt,
+                            cwd=cwd,
+                            resume_session_id=state.session_id,
+                            on_started=_on_started,
+                        )
+                finally:
+                    self._running.pop(session_key, None)
 
-            if result.session_id:
-                self.store.set_session_id(session_key, result.session_id)
-            if result.ok and result.cost_usd:
-                self.usage.record_cost(user_id, result.cost_usd)
+                await self._safe_unreact(message, "⏳")
 
-            await self._deliver_result(target, placeholder, result)
+                if session_key in self._cancelled:
+                    self._cancelled.discard(session_key)
+                    await self._safe_react(message, "⏹")
+                    try:
+                        await placeholder.edit(content="⏹ 已取消")
+                    except discord.HTTPException as e:
+                        log.warning("cancel placeholder edit failed: %s", e)
+                    return
+
+                if result.session_id:
+                    self.store.set_session_id(session_key, result.session_id)
+                if result.ok and result.cost_usd:
+                    self.usage.record_cost(user_id, result.cost_usd)
+
+                if not result.ok:
+                    await self._safe_react(message, "❌")
+                elif result.is_error:
+                    await self._safe_react(message, "⚠️")
+                else:
+                    await self._safe_react(message, "✅")
+
+                await self._deliver_result(target, placeholder, result)
+        finally:
+            self._pending[session_key] -= 1
+            if self._pending[session_key] <= 0:
+                self._pending.pop(session_key, None)
 
     async def _deliver_result(
         self,
@@ -386,6 +428,17 @@ class RemoteBot(commands.Bot):
         if result.cost_usd is not None:
             meta_parts.append(f"${result.cost_usd:.4f}")
         meta = f"  *{' · '.join(meta_parts)}*" if meta_parts else ""
+
+        # Long output → attach as .md file instead of spamming chunks.
+        if len(body) > ATTACHMENT_THRESHOLD:
+            buf = io.BytesIO(body.encode("utf-8"))
+            file = discord.File(buf, filename="response.md")
+            try:
+                await placeholder.delete()
+            except discord.HTTPException:
+                pass
+            await target.send(content=meta or None, file=file)
+            return
 
         chunks = self._chunk_text(body, DISCORD_MSG_LIMIT - len(meta))
         chunks[-1] = chunks[-1] + meta

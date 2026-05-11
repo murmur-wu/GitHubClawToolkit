@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -24,6 +25,7 @@ class ClaudeResult:
     raw: dict | None
     error: str | None = None
     num_turns: int | None = None
+    is_error: bool = False
 
 
 class ClaudeRunner:
@@ -34,10 +36,17 @@ class ClaudeRunner:
         claude_model: str,
         max_budget_usd: float,
     ) -> None:
-        exe = shutil.which("claude") or shutil.which("claude.exe")
+        exe = (
+            shutil.which("claude")
+            or shutil.which("claude.cmd")
+            or shutil.which("claude.exe")
+        )
         if not exe:
             raise SystemExit("`claude` CLI not found on PATH")
-        self._exe = exe
+        if sys.platform == "win32" and exe.lower().endswith((".cmd", ".bat")):
+            self._base_argv: list[str] = ["cmd", "/c", exe]
+        else:
+            self._base_argv = [exe]
         self._permission_mode = permission_mode
         self._timeout = timeout_seconds
         self._model = claude_model
@@ -50,8 +59,7 @@ class ClaudeRunner:
         resume_session_id: str | None,
         on_started: Optional[OnStartedCb] = None,
     ) -> ClaudeResult:
-        args: list[str] = [
-            self._exe,
+        args: list[str] = list(self._base_argv) + [
             "--print",
             "--output-format", "json",
             "--permission-mode", self._permission_mode,
@@ -62,12 +70,14 @@ class ClaudeRunner:
             args.extend(["--model", self._model])
         if self._max_budget > 0:
             args.extend(["--max-budget-usd", str(self._max_budget)])
-        args.append(prompt)
+        # Prompt is piped via stdin to avoid Windows argv quoting issues
+        # with .cmd shims and special characters in user input.
 
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args,
                 cwd=str(cwd),
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -82,7 +92,8 @@ class ClaudeRunner:
 
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=self._timeout
+                proc.communicate(input=prompt.encode("utf-8")),
+                timeout=self._timeout,
             )
         except asyncio.TimeoutError:
             proc.kill()
@@ -117,4 +128,5 @@ class ClaudeRunner:
             duration_ms=payload.get("duration_ms"),
             raw=payload,
             num_turns=payload.get("num_turns"),
+            is_error=bool(payload.get("is_error")),
         )

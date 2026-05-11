@@ -1,4 +1,4 @@
-# Build venv (first run only), install deps, then start bot.
+# Build venv (first run only), install deps, then run bot with auto-restart.
 $ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 
@@ -18,5 +18,10 @@ if (-not (Test-Path .\.env)) {
     exit 1
 }
 
-Write-Host "Starting bot..." -ForegroundColor Green
-& $python bot.py
+while ($true) {
+    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] starting bot..." -ForegroundColor Green
+    & $python bot.py
+    $code = $LASTEXITCODE
+    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] bot exited with code $code; restarting in 5s (Ctrl+C to stop)" -ForegroundColor Yellow
+    Start-Sleep -Seconds 5
+}
